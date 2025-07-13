@@ -1,0 +1,74 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version to deploy'
+        required: true
+        type: string
+
+env:
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+  YC_TOKEN: ${{ secrets.YC_TOKEN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check if image exists
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
+        
+        # Проверяем существование образа с тегом latest
+        if ! docker pull cr.yandex/$REGISTRY_ID/app:${VERSION}_latest; then
+          echo "Error: Image cr.yandex/$REGISTRY_ID/app:${VERSION}_latest not found"
+          exit 1
+        fi
+    
+    - name: Deploy to server
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        
+        # Подключаемся к серверу и деплоим
+        ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+          # Останавливаем старый контейнер
+          docker stop shri-infra-app || true
+          docker rm shri-infra-app || true
+          
+          # Удаляем старый образ
+          docker rmi cr.yandex/$REGISTRY_ID/app:${VERSION}_latest || true
+          
+          # Логинимся в registry
+          echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
+          
+          # Скачиваем новый образ
+          docker pull cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+          
+          # Запускаем новый контейнер
+          docker run -d \
+            --name shri-infra-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+        EOF
+    
+    - name: Find and comment on release issue
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        
+        # Находим issue с релизом
+        ISSUE_NUMBER=$(gh issue list --search "Release v$VERSION" --json number --jq '.[0].number')
+        
+        if [ ! -z "$ISSUE_NUMBER" ]; then
+          gh issue comment $ISSUE_NUMBER --body "## Production Deployment
+        
+        **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        **Deployed by:** ${{ github.actor }}
+        **Status:** ✅ Successfully deployed to production
+        
+        Application is now available at: http://${{ secrets.SERVER_HOST }}:3000/hw/store"
+        fi 

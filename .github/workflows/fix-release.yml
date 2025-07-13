@@ -1,0 +1,136 @@
+name: Fix Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version to fix'
+        required: true
+        type: string
+
+env:
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+  YC_TOKEN: ${{ secrets.YC_TOKEN }}
+
+jobs:
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Type check
+      run: npx tsc --noEmit
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run tests
+      run: npm run test
+
+  create-fix:
+    needs: [type-check, test]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Configure Git
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+    
+    - name: Checkout release branch
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        git fetch origin releases/$VERSION
+        git checkout releases/$VERSION
+    
+    - name: Build and push Docker image
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        FIX_NUMBER=${{ github.run_number }}
+        docker build -t cr.yandex/$REGISTRY_ID/app:${VERSION}_fix${FIX_NUMBER} .
+        docker tag cr.yandex/$REGISTRY_ID/app:${VERSION}_fix${FIX_NUMBER} cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+        
+        echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
+        
+        docker push cr.yandex/$REGISTRY_ID/app:${VERSION}_fix${FIX_NUMBER}
+        docker push cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+    
+    - name: Create fix tag
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        FIX_NUMBER=${{ github.run_number }}
+        git tag v${VERSION}-fix${FIX_NUMBER}
+        git push origin v${VERSION}-fix${FIX_NUMBER}
+    
+    - name: Get commit history
+      id: commits
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        FIX_NUMBER=${{ github.run_number }}
+        PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -z "$PREV_TAG" ]; then
+          COMMITS=$(git log --oneline --no-merges)
+        else
+          COMMITS=$(git log --oneline --no-merges $PREV_TAG..HEAD)
+        fi
+        echo "commits<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Find and comment on release issue
+      run: |
+        VERSION=${{ github.event.inputs.release_version }}
+        FIX_NUMBER=${{ github.run_number }}
+        
+        # Находим issue с релизом
+        ISSUE_NUMBER=$(gh issue list --search "Release v$VERSION" --json number --jq '.[0].number')
+        
+        if [ ! -z "$ISSUE_NUMBER" ]; then
+          gh issue comment $ISSUE_NUMBER --body "## Fix Information
+        
+        **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        **Author:** ${{ github.actor }}
+        **Fix Number:** $FIX_NUMBER
+        
+        ## Commits
+        
+        \`\`\`
+        ${{ steps.commits.outputs.commits }}
+        \`\`\`
+        
+        ## Docker Image
+        
+        \`cr.yandex/$REGISTRY_ID/app:${VERSION}_fix${FIX_NUMBER}\`"
+        fi 

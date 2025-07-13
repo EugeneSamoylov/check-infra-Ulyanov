@@ -1,0 +1,155 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+  YC_TOKEN: ${{ secrets.YC_TOKEN }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linter
+      run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run tests
+      run: npm run test
+
+  create-release:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Configure Git
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+    
+    - name: Create release branch
+      run: |
+        VERSION=${{ github.run_number }}
+        git checkout -b releases/$VERSION
+        git push origin releases/$VERSION
+    
+    - name: Build and push Docker image
+      run: |
+        VERSION=${{ github.run_number }}
+        docker build -t cr.yandex/$REGISTRY_ID/app:$VERSION .
+        docker tag cr.yandex/$REGISTRY_ID/app:$VERSION cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+        
+        echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
+        
+        docker push cr.yandex/$REGISTRY_ID/app:$VERSION
+        docker push cr.yandex/$REGISTRY_ID/app:${VERSION}_latest
+    
+    - name: Create tag
+      run: |
+        VERSION=${{ github.run_number }}
+        git tag v$VERSION
+        git push origin v$VERSION
+    
+    - name: Get commit history
+      id: commits
+      run: |
+        VERSION=${{ github.run_number }}
+        PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -z "$PREV_TAG" ]; then
+          COMMITS=$(git log --oneline --no-merges)
+        else
+          COMMITS=$(git log --oneline --no-merges $PREV_TAG..HEAD)
+        fi
+        echo "commits<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create GitHub Issue
+      run: |
+        VERSION=${{ github.run_number }}
+        gh issue create \
+          --title "Release v$VERSION" \
+          --body "## Release Information
+        
+        **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        **Author:** ${{ github.actor }}
+        **Version:** $VERSION
+        
+        ## Commits
+        
+        \`\`\`
+        ${{ steps.commits.outputs.commits }}
+        \`\`\`
+        
+        ## Docker Image
+        
+        \`cr.yandex/$REGISTRY_ID/app:$VERSION\`"
+    
+    - name: Update CHANGELOG
+      run: |
+        VERSION=${{ github.run_number }}
+        PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -z "$PREV_TAG" ]; then
+          COMMITS=$(git log --oneline --no-merges)
+        else
+          COMMITS=$(git log --oneline --no-merges $PREV_TAG..HEAD)
+        fi
+        
+        # Создаем временный файл с новым содержимым
+        cat > temp_changelog.md << EOF
+        # v$VERSION
+        
+        $COMMITS
+        
+        ---
+        
+        EOF
+        
+        # Добавляем существующий CHANGELOG
+        if [ -f CHANGELOG.md ]; then
+          cat CHANGELOG.md >> temp_changelog.md
+        fi
+        
+        # Заменяем оригинальный файл
+        mv temp_changelog.md CHANGELOG.md
+        
+        git add CHANGELOG.md
+        git commit -m "Update CHANGELOG for v$VERSION"
+        git push origin releases/$VERSION 
